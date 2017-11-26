@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define BUFFER 4096
 
@@ -27,15 +28,16 @@ typedef struct aio_cp_el{
 } aio_cp_el;
 
 int main (int argc, char *argv[]){
-  unsigned n;
+  unsigned n, buffer_size = BUFFER;
   off_t read_offset = 0, write_offset = 0;
-  int in, out, i;
+  int in, out, i, verbose = 0;
   aio_cp_el *block_array;
   off_t file_size, written = 0, write_tmp, read = 0;
   struct stat file_stat;
+  char *bufsize_str;
 
-  if (argc < 3) {
-    fprintf(stderr, "Usage: %s <from> <to> <number of async operation>\n",
+  if (argc < 4) {
+    fprintf(stderr, "Usage: %s <from> <to> <number of async operation> [<size of buffer>] [-v]\n-v stands for 'verbose'\n",
 	    argv[0]);
     exit(EXIT_FAILURE);
   }
@@ -52,6 +54,21 @@ int main (int argc, char *argv[]){
 
   sscanf(argv[3], "%d", &n);
 
+  if (argc > 4){
+    sscanf(argv[4], "%d", &buffer_size);
+    if (buffer_size == 0)
+      buffer_size = BUFFER;
+  }
+
+  printf("Buffersize is %d\n", buffer_size);
+
+  if (argc > 5){
+    if(strstr(argv[5], "-v") != NULL){
+      printf("Verbose mode is active.\n");
+      verbose = 1;
+    }
+  }
+
   if(!fstat(in, &file_stat)){
     file_size = file_stat.st_size;
   }else{
@@ -59,14 +76,17 @@ int main (int argc, char *argv[]){
     return -1;
   }
 
-  if ((file_size / BUFFER) < n){
+  if ((file_size / buffer_size) < n){
     printf("File is to small for %d aio operations!\n", n);
     return 1;
   }
   
-  block_array = (aio_cp_el*) malloc(n*sizeof(aio_cp_el));
+  block_array = (aio_cp_el*) malloc(n*sizeof(aio_cp_el));  
 
   printf("Filesize is: %lu\n", file_size);
+
+  struct timespec requestStart, requestEnd;
+  clock_gettime(CLOCK_REALTIME, &requestStart);
   
   // initialize all async parts, start all independent read operation
   for(i = 0; i < n; i++){
@@ -74,13 +94,13 @@ int main (int argc, char *argv[]){
     block_array[i].write = malloc(sizeof(struct aiocb));
     memset(block_array[i].read, 0, sizeof(struct aiocb));
     memset(block_array[i].write, 0, sizeof(struct aiocb));
-    fill_control_block(block_array[i].read, in, read_offset, NULL, BUFFER);
-    block_array[i].read->aio_buf = malloc(BUFFER);
-    read_offset+=BUFFER;
+    fill_control_block(block_array[i].read, in, read_offset, NULL, buffer_size);
+    block_array[i].read->aio_buf = malloc(buffer_size);
+    read_offset+=buffer_size;
     aio_read(block_array[i].read);
-    fill_control_block(block_array[i].write, out, write_offset, NULL, BUFFER);
-    write_offset+=BUFFER;
-    block_array[i].write->aio_buf = malloc(BUFFER);
+    fill_control_block(block_array[i].write, out, write_offset, NULL, buffer_size);
+    write_offset+=buffer_size;
+    block_array[i].write->aio_buf = malloc(buffer_size);
     block_array[i].status = 0; // 0 - read started, 1 - write started, 2 - nothing
   }
 
@@ -92,20 +112,24 @@ int main (int argc, char *argv[]){
 	  block_array[i].write->aio_nbytes = aio_return(block_array[i].read);
 	  block_array[i].write->aio_offset = block_array[i].read->aio_offset;
 	  read += block_array[i].write->aio_nbytes;
-	  //printf("%ld bytes at offset %ld was read by %d!\n", block_array[i].write->aio_nbytes,block_array[i].write->aio_offset, i);
-	  // printf("%ld bytes read already!\n", read);
+	  if (verbose){
+	    printf("%ld bytes at offset %ld was read by %d!\n", block_array[i].write->aio_nbytes,block_array[i].write->aio_offset, i);
+	    printf("%ld bytes read already!\n", read);
+	  }
 	  memcpy(block_array[i].write->aio_buf, block_array[i].read->aio_buf, block_array[i].write->aio_nbytes);
 	  aio_write(block_array[i].write);
 	}
       }else if (block_array[i].status == 1){ // there is writing going on
 	if (aio_error(block_array[i].write) == 0){ // block was successfully written
 	  written += aio_return(block_array[i].write);
-	  // printf("%ld bytes written at %ld offset by %d!\n",aio_return(block_array[i].write), block_array[i].write->aio_offset ,i );
-	  //printf("written already: %ld\n", written);
+	  if (verbose){
+	    printf("%ld bytes written at %ld offset by %d!\n",aio_return(block_array[i].write), block_array[i].write->aio_offset ,i );
+	    printf("written already: %ld\n", written);
+	  }
 	  block_array[i].status = 2; // 0 - read started, 1 - write started
-	  if (read < file_size && (block_array[i].read->aio_offset + n*BUFFER) < file_size){ // need to read more
-	    block_array[i].read->aio_offset += n*BUFFER;
-	    block_array[i].write->aio_offset += n*BUFFER;
+	  if (read < file_size && (block_array[i].read->aio_offset + n*buffer_size) < file_size){ // need to read more
+	    block_array[i].read->aio_offset += n*buffer_size;
+	    block_array[i].write->aio_offset += n*buffer_size;
 	    //printf("Goint to read %ld bytes from %ld offset! Already read: %ld\n", block_array[i].read->aio_nbytes, block_array[i].read->aio_offset, read );
 	    aio_read(block_array[i].read);
 	    block_array[i].status = 0; // 0 - read started, 1 - write started
@@ -114,6 +138,11 @@ int main (int argc, char *argv[]){
       }
     }
   }
+
+  clock_gettime(CLOCK_REALTIME, &requestEnd);
+  long accum = ( requestEnd.tv_nsec - requestStart.tv_nsec ) + ( requestEnd.tv_sec - requestStart.tv_sec ) * 1E9;
+  printf("Async copy took %ld nanosec\n", accum);
+  
   for (i=0;i<n;i++){
     free(block_array[i].read->aio_buf);
     free(block_array[i].write->aio_buf);
@@ -124,5 +153,15 @@ int main (int argc, char *argv[]){
   close(out);
   free(block_array);
   printf("Total writen: %ld\n", written);
+
+  FILE *stats = fopen("./async_stats.txt", "a");
+  if (stats == NULL){
+    printf("error: %s\n", strerror(errno));
+    return -1;
+  }
+  fprintf(stats, "%ld %d %d\n", accum, n, buffer_size);
+   
+  fclose(stats);
+  
   return 0;
 }
